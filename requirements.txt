@@ -10,4 +10,5 @@ ta>=0.10.2
 xgboost>=2.0.0
 lightgbm>=4.0.0
 neuralprophet>=0.7.0
+torch>=2.0.0,<2.6.0
 pytorch-lightning>=2.0.0
