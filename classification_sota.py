@@ -1,191 +1,157 @@
 import warnings
 import pandas as pd
 import numpy as np
-from neuralprophet import NeuralProphet
-from sklearn.metrics import mean_absolute_error
-from neuralprophet import set_log_level
+import matplotlib.pyplot as plt
+from sklearn.metrics import roc_auc_score, mean_absolute_error
+from sklearn.preprocessing import StandardScaler
+from sklearn.ensemble import GradientBoostingClassifier
+from lightgbm import LGBMClassifier
+import tensorflow as tf
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import LSTM, Dense, Dropout, Input
+from tensorflow.keras.callbacks import EarlyStopping
 
-warnings.filterwarnings("ignore", category=FutureWarning, message="DataFrameGroupBy.apply operated on the grouping columns")
-warnings.filterwarnings("ignore", category=FutureWarning, message="Series.view is deprecated")
+warnings.filterwarnings("ignore")
 
-set_log_level("ERROR")
+def engineer_features(df):
+    d = df.copy()
+    d['return_1'] = d['Close'].pct_change()
+    d['return_5'] = d['Close'].pct_change(5)
+    d['return_10'] = d['Close'].pct_change(10)
+    d['ma_5'] = d['Close'].rolling(5).mean()
+    d['ma_20'] = d['Close'].rolling(20).mean()
+    d['ma_ratio'] = d['ma_5'] / d['ma_20']
+    d['volatility'] = d['return_1'].rolling(10).std()
+    d['momentum'] = d['Close'] / d['Close'].shift(10) - 1
+    delta = d['Close'].diff()
+    gain = delta.clip(lower=0).rolling(14).mean()
+    loss = -delta.clip(upper=0).rolling(14).mean()
+    rs = gain / (loss + 1e-9)
+    d['rsi'] = 100 - (100 / (1 + rs))
+    d['label'] = (d['Close'].shift(-1) > d['Close']).astype(int)
+    d = d.dropna()
+    return d
 
-def build_np_model(epochs: int = 50, n_lags: int = 10, ar_layers_config: list = [8, 8], batch_size: int = 32):
-    m = NeuralProphet(
-        yearly_seasonality=True,
-        weekly_seasonality=True,
-        daily_seasonality=True,
-        n_lags=n_lags,
-        ar_layers=ar_layers_config,
-        epochs=epochs,
-        normalize='soft',
-        impute_missing=True,
-        batch_size=batch_size
-    )
-    return m
+def build_lstm(input_shape):
+    model = Sequential([
+        Input(shape=input_shape),
+        LSTM(64, return_sequences=True),
+        Dropout(0.2),
+        LSTM(32),
+        Dropout(0.2),
+        Dense(16, activation='relu'),
+        Dense(1, activation='sigmoid')
+    ])
+    model.compile(optimizer='adam', loss='binary_crossentropy', metrics=['accuracy'])
+    return model
 
-def calculate_optimal_lags(df_length, n_lags):
-    if n_lags >= df_length:
-        raise ValueError(f"n_lags ({n_lags}) must be smaller than dataset length ({df_length})")
-    return n_lags
+def make_sequences(X, y, seq_len=20):
+    Xs, ys = [], []
+    for i in range(len(X) - seq_len):
+        Xs.append(X[i:i+seq_len])
+        ys.append(y[i+seq_len])
+    return np.array(Xs), np.array(ys)
 
-def train_regression_sota(train_df, test_df, forecast_days, epochs=50, n_lags=10, ar_layers=None, batch_size=32):
-    if ar_layers is None:
-        ar_layers = [8, 8]
+def train_classification_sota(train_df, test_df, lstm_epochs=50, batch_size=16, forecast_days=15):
+    feature_cols = ['return_1','return_5','return_10','ma_ratio','volatility','momentum','rsi']
+    seq_len = 20
 
-    train_np = train_df.rename(columns={'Date': 'ds', 'Close': 'y'})[['ds', 'y']]
-    test_np = test_df.rename(columns={'Date': 'ds', 'Close': 'y'})[['ds', 'y']]
+    train_feat = engineer_features(train_df)
+    test_feat = engineer_features(test_df)
 
-    if train_np.empty or test_np.empty:
-        raise ValueError("One of the DataFrames is empty after renaming.")
+    if len(train_feat) < seq_len + 10:
+        raise ValueError("Not enough training data for classification.")
 
-    train_np = train_np.drop_duplicates(subset=['ds']).sort_values('ds')
-    test_np = test_np.drop_duplicates(subset=['ds']).sort_values('ds')
+    X_train = train_feat[feature_cols].values
+    y_train = train_feat['label'].values
+    X_test = test_feat[feature_cols].values
+    y_test = test_feat['label'].values
 
-    if train_np.empty or test_np.empty:
-        raise ValueError("One of the DataFrames is empty after deduplication.")
+    scaler = StandardScaler()
+    X_train_sc = scaler.fit_transform(X_train)
+    X_test_sc = scaler.transform(X_test)
 
-    total_length = len(train_np)
-    final_lags = calculate_optimal_lags(total_length, n_lags)
+    # --- LSTM ---
+    X_tr_seq, y_tr_seq = make_sequences(X_train_sc, y_train, seq_len)
+    X_te_seq, y_te_seq = make_sequences(X_test_sc, y_test, seq_len)
 
-    if total_length < 226 * 32:
-        print("Warning: Dataset small for optimal LR finding. Consider adding more data.")
+    lstm_proba = np.full(len(y_test), 0.5)
+    if len(X_tr_seq) > 0 and len(X_te_seq) > 0:
+        try:
+            tf.keras.backend.clear_session()
+            lstm = build_lstm((seq_len, len(feature_cols)))
+            es = EarlyStopping(patience=5, restore_best_weights=True)
+            lstm.fit(
+                X_tr_seq, y_tr_seq,
+                epochs=lstm_epochs,
+                batch_size=batch_size,
+                validation_split=0.1,
+                callbacks=[es],
+                verbose=0
+            )
+            lstm_proba_seq = lstm.predict(X_te_seq, verbose=0).flatten()
+            # Align to full test length
+            offset = len(y_test) - len(lstm_proba_seq)
+            lstm_proba[offset:] = lstm_proba_seq
+        except Exception as e:
+            print(f"LSTM failed: {e}")
 
-    m = build_np_model(epochs, n_lags=final_lags, ar_layers_config=ar_layers, batch_size=batch_size)
+    # --- LightGBM ---
+    lgbm = LGBMClassifier(n_estimators=200, learning_rate=0.05, verbose=-1)
+    lgbm.fit(X_train_sc, y_train)
+    lgbm_proba = lgbm.predict_proba(X_test_sc)[:, 1]
+
+    # --- GBM ---
+    gbm = GradientBoostingClassifier(n_estimators=100, learning_rate=0.05)
+    gbm.fit(X_train_sc, y_train)
+    gbm_proba = gbm.predict_proba(X_test_sc)[:, 1]
+
+    # --- Ensemble ---
+    ensemble_proba = (lstm_proba + lgbm_proba + gbm_proba) / 3.0
+    ensemble_pred = (ensemble_proba >= 0.5).astype(int)
 
     try:
-        metrics = m.fit(train_np, freq='D', progress="none")
-        print(metrics)
+        auc = roc_auc_score(y_test, ensemble_proba)
+    except Exception:
+        auc = 0.5
 
-        full_np = pd.concat([train_np, test_np])
-        full_forecast = m.predict(full_np)
+    mae = mean_absolute_error(y_test, ensemble_proba)
 
-        test_forecast = full_forecast[full_forecast['ds'].isin(test_np['ds'])]
+    # --- Price forecast using last known price + predicted direction ---
+    last_price = test_df['Close'].iloc[-1]
+    avg_move = test_df['Close'].pct_change().abs().mean()
+    future_prices = [last_price]
+    for i in range(forecast_days):
+        direction = 1 if ensemble_proba[-1] >= 0.5 else -1
+        next_price = future_prices[-1] * (1 + direction * avg_move)
+        future_prices.append(next_price)
+    future_prices = future_prices[1:]
 
-        if len(test_forecast) > 0 and 'yhat1' in test_forecast.columns:
-            test_merged = test_np.merge(test_forecast[['ds', 'yhat1']], on='ds', how='inner')
-            if len(test_merged) > 0:
-                try:
-                    test_mae = mean_absolute_error(test_merged['y'], test_merged['yhat1'])
-                    direction_acc = 0.0
-                    if len(test_merged) > 1:
-                        actual_changes = np.diff(test_merged['y'].values) > 0
-                        pred_changes = np.diff(test_merged['yhat1'].values) > 0
-                        direction_acc = np.mean(actual_changes == pred_changes)
-                except Exception as e:
-                    test_mae = float('inf')
-                    direction_acc = 0.0
-                    print(f"Error calculating metrics: {e}")
-            else:
-                test_mae = float('inf')
-                direction_acc = 0.0
-        else:
-            test_mae = float('inf')
-            direction_acc = 0.0
+    future_dates = pd.date_range(
+        start=test_df['Date'].iloc[-1] + pd.Timedelta(days=1),
+        periods=forecast_days,
+        freq='B'
+    )
 
-        future = m.make_future_dataframe(train_np, periods=forecast_days, n_historic_predictions=True)
-        forecast = m.predict(future)
+    # --- Figure ---
+    fig, ax = plt.subplots(figsize=(12, 5))
+    historical = pd.concat([train_df, test_df])
+    ax.plot(historical['Date'], historical['Close'], label='Historical', color='blue', linewidth=1.5)
+    ax.plot(future_dates, future_prices, label='Forecast', color='red', linestyle='--', linewidth=2)
+    ax.set_title('Stock Price Forecast (Classification Mode)')
+    ax.set_xlabel('Date')
+    ax.set_ylabel('Price ($)')
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    plt.tight_layout()
 
-        forecast['yhat1'] = (
-            forecast['yhat1']
-            .interpolate(method='linear')
-            .bfill()
-            .ffill()
-        )
-
-        components = ['ar1', 'trend', 'season_yearly', 'season_weekly', 'season_daily']
-        for col in components:
-            if col in forecast.columns:
-                forecast[col] = forecast[col].fillna(0)
-
-        future_predictions = forecast.tail(forecast_days)
-
-        if len(future_predictions) < forecast_days:
-            last_val = future_predictions['yhat1'].iloc[-1] if len(future_predictions) > 0 else 0.0
-            pad = pd.DataFrame({
-                'yhat1': [last_val] * (forecast_days - len(future_predictions))
-            })
-            future_predictions = pd.concat([future_predictions, pad], ignore_index=True)
-
-        future_predictions_values = future_predictions['yhat1'].values
-
-        return {
-            'forecast': future_predictions_values,
-            'mae_test': test_mae,
-            'direction_accuracy': direction_acc,
-            'full_forecast': future_predictions,
-            'n_lags_used': final_lags
-        }
-
-    except Exception as e:
-        if "less than n_forecasts + n_lags" in str(e):
-            fallback_lags = max(1, min(5, total_length - 10))
-            if fallback_lags >= total_length:
-                fallback_lags = max(1, total_length // 2)
-
-            fallback_forecast = min(forecast_days, total_length // 5)
-
-            m_fallback = build_np_model(epochs, n_lags=fallback_lags, ar_layers_config=ar_layers)
-            metrics = m_fallback.fit(train_np, freq='D', progress="none")
-
-            full_np = pd.concat([train_np, test_np])
-            full_forecast = m_fallback.predict(full_np)
-            test_forecast = full_forecast[full_forecast['ds'].isin(test_np['ds'])]
-
-            if len(test_forecast) > 0 and 'yhat1' in test_forecast.columns:
-                test_merged = test_np.merge(test_forecast[['ds', 'yhat1']], on='ds', how='inner')
-                if len(test_merged) > 0:
-                    try:
-                        test_mae = mean_absolute_error(test_merged['y'], test_merged['yhat1'])
-                        direction_acc = 0.0
-                        if len(test_merged) > 1:
-                            actual_changes = np.diff(test_merged['y'].values) > 0
-                            pred_changes = np.diff(test_merged['yhat1'].values) > 0
-                            direction_acc = np.mean(actual_changes == pred_changes)
-                    except Exception as e:
-                        test_mae = float('inf')
-                        direction_acc = 0.0
-                        print(f"Error calculating metrics: {e}")
-                else:
-                    test_mae = float('inf')
-                    direction_acc = 0.0
-            else:
-                test_mae = float('inf')
-                direction_acc = 0.0
-
-            future = m_fallback.make_future_dataframe(train_np, periods=fallback_forecast)
-            forecast = m_fallback.predict(future)
-
-            forecast['yhat1'] = (
-                forecast['yhat1']
-                .interpolate(method='linear')
-                .bfill()
-                .ffill()
-            )
-
-            components = ['ar1', 'trend', 'season_yearly', 'season_weekly', 'season_daily']
-            for col in components:
-                if col in forecast.columns:
-                    forecast[col] = forecast[col].fillna(0)
-
-            future_predictions = forecast.tail(fallback_forecast)
-
-            if len(future_predictions) < forecast_days:
-                last_val = future_predictions['yhat1'].iloc[-1] if len(future_predictions) > 0 else 0.0
-                pad = pd.DataFrame({
-                    'yhat1': [last_val] * (forecast_days - len(future_predictions))
-                })
-                future_predictions = pd.concat([future_predictions, pad], ignore_index=True)
-
-            future_predictions_values = future_predictions['yhat1'].values[:forecast_days]
-
-            return {
-                'forecast': future_predictions_values,
-                'mae_test': test_mae,
-                'direction_accuracy': direction_acc,
-                'full_forecast': future_predictions,
-                'n_lags_used': fallback_lags,
-                'warning': 'Used fallback parameters due to data limitations'
-            }
-        else:
-            raise e
+    return {
+        'auc': auc,
+        'mae': mae,
+        'pred': ensemble_pred,
+        'y_true': y_test,
+        'proba': ensemble_proba,
+        'forecast': np.array(future_prices),
+        'future_dates': future_dates,
+        'fig': fig
+    }
